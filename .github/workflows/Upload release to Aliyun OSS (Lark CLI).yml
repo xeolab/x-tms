@@ -1,0 +1,215 @@
+name: Upload release ZIP to Aliyun OSS
+
+on:
+  release:
+    types: [published, edited]
+  workflow_call:
+    inputs:
+      release_tag:
+        description: GitHub Release tag to upload
+        required: true
+        type: string
+    secrets:
+      OSS_ACCESS_KEY_ID:
+        required: true
+      OSS_ACCESS_KEY_SECRET:
+        required: true
+      FEISHU_WEBHOOK_URL:
+        required: false
+      FEISHU_APP_ID:
+        required: false
+      FEISHU_APP_SECRET:
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aliyun-oss-release-${{ inputs.release_tag || github.event.release.tag_name }}
+  cancel-in-progress: false
+
+env:
+  # 除 AccessKey 外，其余 OSS 配置都在这里修改。
+  OSS_BUCKET: xeo-bj
+  OSS_PREFIX: xeo-big/x-tms/releases
+  OSS_REGION: cn-beijing
+  OSS_ENDPOINT: https://oss-cn-beijing.aliyuncs.com
+  OSS_BASE_URL: https://cdn.xeo.com.cn
+
+  # 固定 ossutil 版本和校验值，避免下载内容在不知情时发生变化。
+  OSSUTIL_VERSION: "2.3.0"
+  OSSUTIL_ARCHIVE: ossutil-2.3.0-linux-amd64.zip
+  OSSUTIL_SHA256: 3ae4d9fc85a7a6e9f5654d1599766f1a3a42a3692870887b5ae9338d582ef65a
+
+jobs:
+  upload-release:
+    name: Package and upload release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      # 在仓库 Settings > Secrets and variables > Actions 中创建这些 Secret。
+      OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+      OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+
+      # 飞书自建应用。应用没有 webhook——它直接调 OpenAPI 发消息，
+      # 所以这里要的是 app 凭证，不是 webhook URL。
+      FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+      FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+      # 卡片发到哪个群（oc_ 开头）。不配则退回 FEISHU_WEBHOOK_URL。
+      FEISHU_CHAT_ID: ${{ vars.FEISHU_CHAT_ID }}
+      FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+      # 发版记录表（多维表格）。不配则只发卡片、不写表。
+      FEISHU_BASE_APP_TOKEN: ${{ vars.FEISHU_BASE_APP_TOKEN }}
+      FEISHU_BASE_TABLE_ID: ${{ vars.FEISHU_BASE_TABLE_ID }}
+      FEISHU_BASE_URL: ${{ vars.FEISHU_BASE_URL }}
+      # 表列名被改过才需要这两个，平时留空
+      FEISHU_BASE_KEY_FIELD: ${{ vars.FEISHU_BASE_KEY_FIELD }}
+      FEISHU_BASE_FIELD_MAP: ${{ vars.FEISHU_BASE_FIELD_MAP }}
+
+      XEO_PROJECT: X-TMS
+
+    steps:
+      - name: Check out the released tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.event.release.tag_name }}
+          # Release 正文为空时，靠提交记录自动整理 changelog
+          fetch-depth: 0
+
+      - name: Validate configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          : "${OSS_ACCESS_KEY_ID:?Missing GitHub Secret: OSS_ACCESS_KEY_ID}"
+          : "${OSS_ACCESS_KEY_SECRET:?Missing GitHub Secret: OSS_ACCESS_KEY_SECRET}"
+          : "${OSS_REGION:?OSS_REGION must be configured}"
+          : "${OSS_ENDPOINT:?OSS_ENDPOINT must be configured}"
+          : "${OSS_BASE_URL:?OSS_BASE_URL must be configured}"
+
+          if [[ -z "${OSS_BUCKET}" || "${OSS_BUCKET}" == "your-bucket-name" ]]; then
+            echo "Please set OSS_BUCKET in this workflow." >&2
+            exit 1
+          fi
+
+          : "${FEISHU_APP_ID:?Missing GitHub Secret: FEISHU_APP_ID}"
+          : "${FEISHU_APP_SECRET:?Missing GitHub Secret: FEISHU_APP_SECRET}"
+
+          if [[ -z "${FEISHU_CHAT_ID}" && -z "${FEISHU_WEBHOOK_URL}" ]]; then
+            echo "需要 FEISHU_CHAT_ID（推荐）或 FEISHU_WEBHOOK_URL 之一，否则卡片没处发。" >&2
+            exit 1
+          fi
+
+          if [[ ! -f .github/scripts/feishu_release.py ]]; then
+            echo "缺少 .github/scripts/feishu_release.py，从 xeo-pm 复制过来。" >&2
+            exit 1
+          fi
+
+      - name: Download release assets and create ZIP
+        id: package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          repository_name="${GITHUB_REPOSITORY#*/}"
+          safe_tag="$(printf '%s' "${RELEASE_TAG}" | tr -c 'A-Za-z0-9._-' '-')"
+          archive_name="${repository_name}-${safe_tag}.zip"
+          archive_path="${RUNNER_TEMP}/${archive_name}"
+          asset_count="$(gh release view "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --json assets \
+            --jq '.assets | length')"
+
+          if (( asset_count > 0 )); then
+            mkdir -p release-assets
+            gh release download "${RELEASE_TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --dir release-assets
+            (
+              cd release-assets
+              zip -q -r "${archive_path}" .
+            )
+          else
+            # GitHub Release 没有附件时，打包该标签对应的仓库源码。
+            git archive \
+              --format=zip \
+              --prefix="${repository_name}-${safe_tag}/" \
+              --output="${archive_path}" \
+              "${RELEASE_TAG}"
+          fi
+
+          sha256sum "${archive_path}"
+          release_json="$(gh release view "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --json url,publishedAt)"
+
+          echo "archive_name=${archive_name}" >> "${GITHUB_OUTPUT}"
+          echo "archive_path=${archive_path}" >> "${GITHUB_OUTPUT}"
+          echo "release_url=$(jq -r '.url' <<< "${release_json}")" >> "${GITHUB_OUTPUT}"
+          echo "published_at=$(jq -r '.publishedAt' <<< "${release_json}")" >> "${GITHUB_OUTPUT}"
+
+      - name: Install ossutil
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "${RUNNER_TEMP}"
+          curl --fail --silent --show-error --location \
+            --output "${OSSUTIL_ARCHIVE}" \
+            "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ARCHIVE}"
+          echo "${OSSUTIL_SHA256}  ${OSSUTIL_ARCHIVE}" | sha256sum --check --strict
+          unzip -q "${OSSUTIL_ARCHIVE}"
+          install -m 0755 \
+            "ossutil-${OSSUTIL_VERSION}-linux-amd64/ossutil" \
+            "${RUNNER_TEMP}/ossutil"
+          "${RUNNER_TEMP}/ossutil" version
+
+      - name: Upload ZIP to Aliyun OSS
+        id: upload
+        env:
+          ARCHIVE_NAME: ${{ steps.package.outputs.archive_name }}
+          ARCHIVE_PATH: ${{ steps.package.outputs.archive_path }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          normalized_prefix="${OSS_PREFIX#/}"
+          normalized_prefix="${normalized_prefix%/}"
+          if [[ -n "${normalized_prefix}" ]]; then
+            object_path="${normalized_prefix}/${RELEASE_TAG}/${ARCHIVE_NAME}"
+          else
+            object_path="${RELEASE_TAG}/${ARCHIVE_NAME}"
+          fi
+          destination="oss://${OSS_BUCKET}/${object_path}"
+          public_url="${OSS_BASE_URL%/}/${object_path}"
+
+          "${RUNNER_TEMP}/ossutil" cp --force "${ARCHIVE_PATH}" "${destination}"
+
+          echo "destination=${destination}" >> "${GITHUB_OUTPUT}"
+          echo "public_url=${public_url}" >> "${GITHUB_OUTPUT}"
+
+          {
+            echo "### Aliyun OSS upload complete"
+            echo
+            echo "- Release: \`${RELEASE_TAG}\`"
+            echo "- Object: \`${destination}\`"
+            echo "- CDN URL: ${public_url}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Sync release to Feishu
+        env:
+          ARCHIVE_NAME: ${{ steps.package.outputs.archive_name }}
+          ARCHIVE_PATH: ${{ steps.package.outputs.archive_path }}
+          PUBLIC_URL: ${{ steps.upload.outputs.public_url }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          export ARCHIVE_SHA256="$(sha256sum "${ARCHIVE_PATH}" | cut -d' ' -f1)"
+          python3 .github/scripts/feishu_release.py --from-event
